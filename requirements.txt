@@ -1,0 +1,6 @@
+ollama          # local LLM client
+fastmcp         # MCP server/client (used by mcp_server.py and mcp_connector.py)
+python-dotenv   # .env loading
+requests        # HTTP for tools that need it
+prompt_toolkit  # rich REPL (multiline input, history, slash-completer)
+chromadb        # vector store for RAG sources (rag_store.py)

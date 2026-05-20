@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# ivy — launcher for the IVY CLI assistant.
+# Like `claude`, it runs from any working directory; the CLI inherits $PWD
+# as its project root for filesystem tools.
+
+set -e
+
+# Resolve the real location of this script (follow symlinks so /opt/homebrew/bin/ivy works).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" = /* ]]; then
+    SOURCE="$TARGET"
+  else
+    SOURCE="$(dirname "$SOURCE")/$TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+CLI_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+VENV_PY="$CLI_DIR/.venv/bin/python"
+ENTRY="$CLI_DIR/mcp_client.py"
+
+if [ ! -x "$VENV_PY" ]; then
+  echo "ivy: virtualenv not found at $CLI_DIR/.venv" >&2
+  echo "Set it up once with:" >&2
+  echo "  python3 -m venv \"$CLI_DIR/.venv\"" >&2
+  echo "  \"$CLI_DIR/.venv/bin/pip\" install -r \"$CLI_DIR/requirements.txt\"" >&2
+  exit 1
+fi
+
+# Run the CLI from the caller's $PWD (Claude-Code style cwd awareness).
+exec "$VENV_PY" "$ENTRY" "$@"

@@ -1,0 +1,739 @@
+# mcp_server.py — IVY tool catalog.
+#
+# Tools are exposed via @mcp.tool() AND imported directly into mcp_client.py
+# (see TOOL_MAP). The direct-import path is what the agent actually calls;
+# the FastMCP decoration is kept for future MCP-protocol use.
+from fastmcp import FastMCP
+from pathlib import Path
+from datetime import datetime
+from html.parser import HTMLParser
+import os
+import re
+import shutil
+import difflib
+import subprocess
+import urllib.request
+import urllib.error
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Working directory — starts as the server's own cwd,
+# overridden at session start by the client via set_working_directory().
+_working_dir: Path = Path.cwd().resolve()
+
+mcp = FastMCP("IVY tools")
+
+# -----------------------
+# Utility helpers
+# -----------------------
+
+def resolve_path(path: str) -> Path:
+    """Resolve a relative (or absolute) path against the current working dir."""
+    p = Path(path)
+    return (p if p.is_absolute() else (_working_dir / p)).resolve()
+
+
+def _backup(file_path: Path) -> Path:
+    backup = file_path.with_suffix(file_path.suffix + ".bak")
+    shutil.copy2(file_path, backup)
+    return backup
+
+
+def _unified_diff(original: str, updated: str, label: str) -> str:
+    diff = difflib.unified_diff(
+        original.splitlines(keepends=True),
+        updated.splitlines(keepends=True),
+        fromfile=f"a/{label}",
+        tofile=f"b/{label}",
+        n=3,
+    )
+    return "".join(list(diff)[:80])  # cap at 80 lines
+
+
+# -----------------------
+# Working directory
+# -----------------------
+
+@mcp.tool()
+def set_working_directory(path: str) -> str:
+    """Set the base working directory for all subsequent file operations.
+    Called automatically by the client at session start with its own cwd.
+
+    Args:
+        path: Absolute path to use as the working directory
+    """
+    global _working_dir
+    target = Path(path).resolve()
+    if not target.exists():
+        return f"Error: path does not exist: {path}"
+    if not target.is_dir():
+        return f"Error: path is not a directory: {path}"
+    _working_dir = target
+    return f"✓ Working directory set to {_working_dir}"
+
+
+@mcp.tool()
+def get_working_directory() -> str:
+    """Return the current working directory used for file operations."""
+    return str(_working_dir)
+
+
+@mcp.tool()
+def get_date_time() -> str:
+    """Get the current date and time."""
+    return datetime.now().strftime("%Y-%m-%d %I:%M %p")
+
+
+# -----------------------
+# Filesystem – Discovery
+# -----------------------
+
+@mcp.tool()
+def glob(pattern: str, path: str = ".") -> list:
+    """Find files matching a glob pattern under a directory (recursive).
+
+    Examples: '**/*.py', 'src/**/test_*.py', '*.md'. Returns up to 200 matches.
+
+    Args:
+        pattern: Glob pattern (supports **, *, ?, [...])
+        path: Root directory (default: working directory)
+    """
+    root = resolve_path(path)
+    if not root.is_dir():
+        return [f"Error: {path} is not a directory"]
+    results = []
+    try:
+        for f in sorted(root.glob(pattern)):
+            if f.is_file():
+                results.append(str(f.relative_to(root)))
+                if len(results) >= 200:
+                    break
+    except Exception as e:
+        return [f"Error: {e}"]
+    if not results:
+        return [f"No files matching '{pattern}' in {path}"]
+    return results
+
+
+@mcp.tool()
+def list_directory(path: str = ".") -> list:
+    """List files and directories at the given path, with type indicators."""
+    dir_path = resolve_path(path)
+    if not dir_path.exists():
+        return ["Directory does not exist."]
+    entries = []
+    for p in sorted(dir_path.iterdir()):
+        kind = "📁" if p.is_dir() else "📄"
+        size = f"  {p.stat().st_size:,} bytes" if p.is_file() else ""
+        entries.append(f"{kind} {p.name}{size}")
+    return entries
+
+
+@mcp.tool()
+def list_directory_tree(path: str = ".", max_depth: int = 2) -> str:
+    """Show a tree view of a directory up to a given depth.
+
+    Args:
+        path: Root directory (default: working directory)
+        max_depth: How many levels deep to show (default 2)
+    """
+    root = resolve_path(path)
+    if not root.is_dir():
+        return f"Error: {path} is not a directory"
+
+    lines = [f"{root.name}/"]
+
+    def _walk(dir_: Path, prefix: str, depth: int):
+        if depth > max_depth:
+            return
+        entries = sorted(dir_.iterdir(), key=lambda p: (p.is_file(), p.name))
+        for i, entry in enumerate(entries):
+            connector = "└── " if i == len(entries) - 1 else "├── "
+            lines.append(prefix + connector + entry.name + ("/" if entry.is_dir() else ""))
+            if entry.is_dir():
+                ext = "    " if i == len(entries) - 1 else "│   "
+                _walk(entry, prefix + ext, depth + 1)
+
+    _walk(root, "", 1)
+    return "\n".join(lines)
+
+
+# -----------------------
+# Filesystem – Read
+# -----------------------
+
+@mcp.tool()
+def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+    """Read a file. Returns full contents by default.
+
+    To read only a range, pass start_line and end_line (1-indexed, inclusive).
+    For large files, prefer reading a range to keep context small.
+
+    Args:
+        path: Relative or absolute path to the file
+        start_line: First line (1-indexed). 0 = from the beginning.
+        end_line: Last line (1-indexed). 0 = until the end.
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return "File does not exist."
+    if start_line == 0 and end_line == 0:
+        return file_path.read_text(encoding="utf-8")
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    total = len(lines)
+    s = max(0, (start_line - 1) if start_line > 0 else 0)
+    e = total if end_line == 0 else min(total, end_line)
+    body = "\n".join(f"{i+s+1:4}: {line}" for i, line in enumerate(lines[s:e]))
+    return f"── {path}  lines {s+1}–{e} of {total} ──\n{body}"
+
+
+@mcp.tool()
+def search_in_file(path: str, pattern: str, use_regex: bool = False) -> str:
+    """Search for a pattern inside a file and return matching lines with line numbers.
+
+    Args:
+        path: Relative path to the file
+        pattern: Text or regex pattern to search for
+        use_regex: If True, treat pattern as a regular expression
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return "File does not exist."
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    matches = []
+    for i, line in enumerate(lines, 1):
+        hit = re.search(pattern, line) if use_regex else pattern in line
+        if hit:
+            matches.append(f"{i:4}: {line}")
+    if not matches:
+        return f"No matches found for '{pattern}' in {path}"
+    return f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+
+
+@mcp.tool()
+def grep_directory(path: str, pattern: str, extension: str = "") -> str:
+    """Search for a pattern across all files in a directory.
+
+    Args:
+        path: Relative path to the directory
+        pattern: Text to search for
+        extension: Optional file extension filter, e.g. '.py'
+    """
+    dir_path = resolve_path(path)
+    if not dir_path.is_dir():
+        return "Not a directory."
+    results = []
+    for file in sorted(dir_path.rglob(f"*{extension}" if extension else "*")):
+        if file.is_file():
+            try:
+                text = file.read_text(encoding="utf-8", errors="ignore")
+                for i, line in enumerate(text.splitlines(), 1):
+                    if pattern in line:
+                        try:
+                            rel = file.relative_to(_working_dir)
+                        except ValueError:
+                            rel = file
+                        results.append(f"{rel}:{i}: {line.strip()}")
+            except Exception:
+                pass
+    if not results:
+        return f"No matches for '{pattern}'"
+    return "\n".join(results[:200])
+
+
+@mcp.tool()
+def file_info(path: str) -> dict:
+    """Get metadata about a file: size, line count, last modified.
+
+    Args:
+        path: Relative path to the file
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return {"error": "File does not exist."}
+    stat = file_path.stat()
+    lines = 0
+    try:
+        lines = len(file_path.read_text(encoding="utf-8", errors="ignore").splitlines())
+    except Exception:
+        pass
+    try:
+        rel = str(file_path.relative_to(_working_dir))
+    except ValueError:
+        rel = str(file_path)
+    return {
+        "path": rel,
+        "size_bytes": stat.st_size,
+        "lines": lines,
+        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "is_file": file_path.is_file(),
+    }
+
+
+# -----------------------
+# Filesystem – Write
+# -----------------------
+
+@mcp.tool()
+def write_file(path: str, content: str) -> str:
+    """Create or fully overwrite a file with the given content.
+
+    For modifying part of an existing file, prefer str_replace_in_file or
+    multi_edit — they preserve unchanged content and emit a verifiable diff.
+
+    Args:
+        path: Relative path to the file
+        content: Full content to write
+    """
+    file_path = resolve_path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    return f"Written {len(content):,} chars to {file_path}"
+
+
+@mcp.tool()
+def str_replace_in_file(path: str, old_str: str, new_str: str) -> str:
+    """Replace the first exact occurrence of `old_str` with `new_str` in a file.
+
+    The preferred way to edit a file without rewriting it. `old_str` must be
+    unique in the file (whitespace and indentation must match exactly).
+    Returns a unified diff. Creates a .bak backup; use restore_backup to undo.
+
+    Args:
+        path: Relative path to the file
+        old_str: Exact text to find and replace (must be unique in the file)
+        new_str: Replacement text
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return "File does not exist."
+    original = file_path.read_text(encoding="utf-8")
+    count = original.count(old_str)
+    if count == 0:
+        return f"Error: `old_str` not found in {path}. Check exact whitespace and indentation."
+    if count > 1:
+        return (
+            f"Error: `old_str` found {count} times in {path}. "
+            "Make it more specific so it's unique."
+        )
+    updated = original.replace(old_str, new_str, 1)
+    backup = _backup(file_path)
+    file_path.write_text(updated, encoding="utf-8")
+    return f"✓ Replaced in {path}\nBackup saved to {backup.name}\n\n{_unified_diff(original, updated, path)}"
+
+
+@mcp.tool()
+def multi_edit(path: str, edits: list) -> str:
+    """Apply a list of (old, new) edits to one file atomically.
+
+    Each edit's `old` text must locate exactly once in the current buffer state
+    (after preceding edits in this batch). If ANY edit fails, NO changes are
+    written. Use this for multiple related edits to the same file — saves
+    round-trips and prevents partial-update corruption.
+
+    Args:
+        path: Relative path to the file
+        edits: List of {"old": str, "new": str} dicts, applied in order
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return "File does not exist."
+    if not edits:
+        return "Error: edits list is empty."
+    original = file_path.read_text(encoding="utf-8")
+    buffer = original
+    for i, edit in enumerate(edits):
+        if not isinstance(edit, dict) or "old" not in edit or "new" not in edit:
+            return f"Error: edit #{i+1} must be a dict with keys 'old' and 'new'."
+        old_str, new_str = edit["old"], edit["new"]
+        count = buffer.count(old_str)
+        if count == 0:
+            return f"Error: edit #{i+1}: `old` not found. Aborting (no changes written)."
+        if count > 1:
+            return f"Error: edit #{i+1}: `old` found {count} times. Make it unique. Aborting."
+        buffer = buffer.replace(old_str, new_str, 1)
+    backup = _backup(file_path)
+    file_path.write_text(buffer, encoding="utf-8")
+    return f"✓ Applied {len(edits)} edit(s) to {path}\nBackup saved to {backup.name}\n\n{_unified_diff(original, buffer, path)}"
+
+
+@mcp.tool()
+def regex_replace_in_file(path: str, pattern: str, replacement: str, count: int = 0) -> str:
+    """Replace text matching a regex pattern in a file.
+
+    Use sparingly — regex can match more than expected. Prefer str_replace_in_file
+    for exact-text replacement.
+
+    Args:
+        path: Relative path to the file
+        pattern: Python regex pattern to match
+        replacement: Replacement string (supports backreferences like \\1)
+        count: Max replacements (0 = replace all)
+    """
+    file_path = resolve_path(path)
+    if not file_path.exists():
+        return "File does not exist."
+    original = file_path.read_text(encoding="utf-8")
+    try:
+        updated, n = re.subn(pattern, replacement, original, count=count)
+    except re.error as e:
+        return f"Error: invalid regex: {e}"
+    if n == 0:
+        return f"No matches for pattern '{pattern}' in {path}"
+    _backup(file_path)
+    file_path.write_text(updated, encoding="utf-8")
+    return f"✓ Made {n} replacement(s) in {path}\n\n{_unified_diff(original, updated, path)}"
+
+
+@mcp.tool()
+def restore_backup(path: str) -> str:
+    """Restore a file from its .bak backup created by the last edit operation.
+
+    Args:
+        path: Relative path to the original file (not the .bak)
+    """
+    file_path = resolve_path(path)
+    backup = file_path.with_suffix(file_path.suffix + ".bak")
+    if not backup.exists():
+        return f"No backup found for {path}"
+    shutil.copy2(backup, file_path)
+    return f"✓ Restored {path} from backup"
+
+
+@mcp.tool()
+def diff_file(path: str) -> str:
+    """Show a unified diff between a file and its .bak backup.
+
+    Use after editing to confirm what changed.
+
+    Args:
+        path: Relative path to the file (not the .bak)
+    """
+    file_path = resolve_path(path)
+    backup = file_path.with_suffix(file_path.suffix + ".bak")
+    if not file_path.exists():
+        return "File does not exist."
+    if not backup.exists():
+        return f"No backup found for {path} — no edits to compare against."
+    current = file_path.read_text(encoding="utf-8")
+    previous = backup.read_text(encoding="utf-8")
+    if current == previous:
+        return f"No changes between {path} and {backup.name}."
+    return _unified_diff(previous, current, path) or "(empty diff)"
+
+
+# -----------------------
+# Filesystem – Manage
+# -----------------------
+
+@mcp.tool()
+def delete_file(path: str) -> str:
+    """Delete a file."""
+    file_path = resolve_path(path)
+    if file_path.exists():
+        file_path.unlink()
+        return f"✓ Deleted {path}"
+    return "File does not exist."
+
+
+@mcp.tool()
+def rename_file(old_path: str, new_path: str) -> str:
+    """Rename or move a file within the base directory.
+
+    Args:
+        old_path: Current relative path
+        new_path: New relative path
+    """
+    src = resolve_path(old_path)
+    dst = resolve_path(new_path)
+    if not src.exists():
+        return "Source file does not exist."
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    return f"✓ Moved {old_path} → {new_path}"
+
+
+@mcp.tool()
+def make_directory(path: str) -> str:
+    """Create a directory (and any missing parents).
+
+    Args:
+        path: Relative path for the new directory
+    """
+    dir_path = resolve_path(path)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return f"✓ Directory created: {path}"
+
+
+# -----------------------
+# Shell + git
+# -----------------------
+
+_SHELL_OUTPUT_CAP = 4000
+
+
+def _cap(text: str) -> str:
+    if len(text) > _SHELL_OUTPUT_CAP:
+        return text[:_SHELL_OUTPUT_CAP] + f"\n…(truncated, {len(text) - _SHELL_OUTPUT_CAP} more chars)"
+    return text
+
+
+def _run_subprocess(cmd, timeout: int = 30, shell: bool = False) -> dict:
+    """Centralized subprocess runner. Used by run_shell, git_status, git_diff."""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=shell,
+            cwd=str(_working_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"Command timed out after {timeout}s", "exit_code": -1}
+    except FileNotFoundError as e:
+        return {"error": f"Command not found: {e}", "exit_code": -1}
+    return {
+        "exit_code": result.returncode,
+        "stdout": _cap(result.stdout or ""),
+        "stderr": _cap(result.stderr or ""),
+    }
+
+
+@mcp.tool()
+def run_shell(command: str, timeout: int = 30) -> dict:
+    """Run a shell command in the working directory and return its output.
+
+    Output is capped at ~4k chars per stream. Use for running tests, linters,
+    package installs, git ops, scripts. Default timeout is 30s.
+
+    Args:
+        command: Full shell command, e.g. "python -m pytest -x" or "npm run build"
+        timeout: Max seconds to wait (default 30)
+    """
+    return _run_subprocess(command, timeout=timeout, shell=True)
+
+
+@mcp.tool()
+def git_status() -> str:
+    """Show `git status --short --branch` for the working directory."""
+    r = _run_subprocess(["git", "status", "--short", "--branch"])
+    if r.get("error"):
+        return r["error"]
+    if r["exit_code"] != 0:
+        return r.get("stderr") or "git status failed."
+    return r.get("stdout") or "(clean working tree)"
+
+
+@mcp.tool()
+def git_diff(path: str = "") -> str:
+    """Show `git diff` for a path (or the whole working tree if path is empty).
+
+    Args:
+        path: Optional file or directory to diff (default: all changes)
+    """
+    cmd = ["git", "diff"]
+    if path:
+        cmd.append(path)
+    r = _run_subprocess(cmd, timeout=15)
+    if r.get("error"):
+        return r["error"]
+    return r.get("stdout") or "(no diff)"
+
+
+# -----------------------
+# Web
+# -----------------------
+
+class _HTMLTextExtractor(HTMLParser):
+    """Strip tags and return readable text. Skip script/style/etc."""
+    SKIP = {"script", "style", "noscript", "iframe", "svg"}
+
+    def __init__(self):
+        super().__init__()
+        self._chunks: list = []
+        self._skipping = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self.SKIP:
+            self._skipping += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self.SKIP and self._skipping > 0:
+            self._skipping -= 1
+
+    def handle_data(self, data):
+        if not self._skipping:
+            self._chunks.append(data)
+
+    def text(self) -> str:
+        return re.sub(r"\n{3,}", "\n\n", "".join(self._chunks).strip())
+
+
+_WEB_FETCH_CAP = 8000
+
+
+@mcp.tool()
+def web_fetch(url: str) -> str:
+    """Fetch a URL and return its stripped text content.
+
+    HTML is converted to plain text. Output is capped at ~8k chars. Use for
+    reading docs, API references, blog posts when the answer is on the web.
+
+    Args:
+        url: Full URL starting with http:// or https://
+    """
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return "Error: URL must start with http:// or https://"
+    req = urllib.request.Request(url, headers={"User-Agent": "IVY-CLI/0.1"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read(_WEB_FETCH_CAP * 8).decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        return f"Error: HTTP {e.code} {e.reason}"
+    except Exception as e:
+        return f"Error fetching {url}: {e}"
+    if "html" in ctype.lower():
+        parser = _HTMLTextExtractor()
+        parser.feed(raw)
+        text = parser.text()
+    else:
+        text = raw
+    if len(text) > _WEB_FETCH_CAP:
+        text = text[:_WEB_FETCH_CAP] + f"\n…(truncated, fetched from {url})"
+    return text
+
+
+# -----------------------
+# Planning
+# -----------------------
+
+@mcp.tool()
+def propose_plan(steps: list) -> dict:
+    """Declare your plan as a list of steps BEFORE making changes to the filesystem.
+
+    Use this for non-trivial tasks (3+ steps, multiple files, refactors). The
+    plan is echoed back so it appears as a visible artifact to the user.
+
+    Args:
+        steps: Ordered list of short step descriptions (strings)
+    """
+    if not isinstance(steps, list) or not steps:
+        return {"error": "steps must be a non-empty list of strings"}
+    return {
+        "plan": [str(s) for s in steps],
+        "step_count": len(steps),
+        "note": "Plan recorded. Execute step-by-step using the appropriate tools.",
+    }
+
+
+# -----------------------
+# Code-generation delegate
+# -----------------------
+
+CODER_MODEL = "deepseek-coder-v2:16b"
+
+
+def _set_coder_model(name: str) -> None:
+    global CODER_MODEL
+    CODER_MODEL = name
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove leading/trailing markdown fences if the model wrapped its output."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def generate_code(prompt: str, language: str = "python", context: str = "") -> dict:
+    """Delegate code writing to a specialized coding model. Call this ANY time
+    the user asks for code (write, refactor, fix, optimize). Do NOT write code
+    yourself. After receiving the code, use write_file / str_replace_in_file /
+    multi_edit to save it.
+
+    Args:
+        prompt: clear natural-language description of the code to write
+        language: programming language (e.g. python, javascript, typescript, go)
+        context: optional snippet of existing code / constraints for the coder model
+    """
+    import sys
+    import time
+    import ollama
+
+    system = (
+        f"You are a {language} coding expert. Output only valid, idiomatic {language} "
+        "code that fulfills the request. No prose, no explanation, no markdown fences."
+    )
+    user = prompt
+    if context:
+        user += f"\n\nExisting context:\n{context}"
+
+    sys.stdout.write(f"    ↳ {CODER_MODEL}  starting...")
+    sys.stdout.flush()
+
+    code_parts: list = []
+    in_tokens = 0
+    out_tokens = 0
+    live_count = 0
+    t_start = time.time()
+
+    try:
+        for chunk in ollama.chat(
+            model=CODER_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            stream=True,
+        ):
+            msg = chunk.get("message") if isinstance(chunk, dict) else getattr(chunk, "message", None)
+            msg_d = msg if isinstance(msg, dict) else (msg.model_dump() if msg and hasattr(msg, "model_dump") else (vars(msg) if msg else {}))
+            content = msg_d.get("content") if msg_d else None
+            if content:
+                code_parts.append(content)
+                live_count += 1
+                live_elapsed = time.time() - t_start
+                live_rate = (live_count / live_elapsed) if live_elapsed > 0 else 0.0
+                sys.stdout.write(f"\r    ↳ {CODER_MODEL}  ·  {live_count} tok  ·  {live_rate:.1f} tok/s    ")
+                sys.stdout.flush()
+            done = chunk.get("done") if isinstance(chunk, dict) else getattr(chunk, "done", False)
+            if done:
+                get = chunk.get if isinstance(chunk, dict) else (lambda k, d=0: getattr(chunk, k, d))
+                in_tokens = get("prompt_eval_count", 0) or 0
+                out_tokens = get("eval_count", 0) or live_count
+    except Exception as e:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+        return {"error": f"Coder model failed: {e}", "delegate_model": CODER_MODEL}
+
+    elapsed = time.time() - t_start
+    rate = (out_tokens / elapsed) if elapsed > 0 and out_tokens else 0.0
+    sys.stdout.write(
+        f"\r    ↳ {CODER_MODEL}  ·  in {in_tokens}  ·  out {out_tokens}  ·  {elapsed:.2f}s  ·  {rate:.1f} tok/s            \n"
+    )
+    sys.stdout.flush()
+
+    code = _strip_code_fences("".join(code_parts))
+    return {
+        "language": language,
+        "code": code,
+        "tokens_in": in_tokens,
+        "tokens_out": out_tokens,
+        "elapsed_s": round(elapsed, 2),
+        "tokens_per_s": round(rate, 1),
+        "delegate_model": CODER_MODEL,
+    }
+
+
+if __name__ == "__main__":
+    mcp.run(transport="http", port=8087)
