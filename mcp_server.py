@@ -580,82 +580,135 @@ def git_run(args: str, timeout: int = 30) -> dict:
     return r
 
 
-# Generic / low-quality commit messages that the diff-aware path rejects.
-# The model has to look at the actual changes and write something specific.
+import hashlib as _hashlib
+
+# Single-word commit messages that get auto-rejected. The model has to look at
+# the actual changes and write something specific.
 _GENERIC_COMMIT_MESSAGES = {
     "update", "updates", "updated", "changes", "change", "edits", "edit",
     "fix", "fixes", "fixed", "wip", "stuff", "commit", "misc", "tweaks",
     "ok", "done", "save", "various", "improvements",
 }
 
+# Phrases that are vague paraphrases of the user prompt rather than descriptions
+# of actual code changes. Reject these even when the message is long enough.
+_VAGUE_COMMIT_PHRASES = (
+    "my changes", "my updates", "my latest", "the changes", "the updates",
+    "your changes", "your updates", "latest changes", "latest updates",
+    "current changes", "current updates", "recent changes", "push and",
+    "check and push",
+)
+
+
+def _hash_staged_diff(cwd: str) -> tuple[str, str, str]:
+    """Returns (hash, --stat output, raw diff). Hash is sha256[:16] of the raw diff."""
+    import subprocess as _sp
+    stat = _sp.run(["git", "diff", "--staged", "--stat"],
+                   cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
+    diff = _sp.run(["git", "diff", "--staged"],
+                   cwd=cwd, capture_output=True, text=True, timeout=10).stdout
+    h = _hashlib.sha256(diff.encode("utf-8")).hexdigest()[:16]
+    return h, stat, diff
+
 
 @mcp.tool()
-def git_commit_and_push(message: str = "", add_all: bool = True) -> dict:
-    """ATOMIC end-to-end: stage all changes, commit with `message`, and push.
+def git_commit_and_push(message: str = "", add_all: bool = True, diff_hash: str = "") -> dict:
+    """ATOMIC commit + push, with MANDATORY diff-inspection handoff.
 
-    DIFF-AWARE WORKFLOW (two-call pattern):
-      1. FIRST call with no message (or `message=""`) — the tool stages changes
-         and returns the STAGED DIFF + a per-file summary. You then read that
-         and write a descriptive commit message based on the actual changes.
-      2. SECOND call with `message=<your descriptive message>` — the tool
-         commits + pushes for real.
+    REQUIRED two-call pattern — you cannot skip it:
 
-    USE THIS for any 'push my changes' / 'send to github' request. The two-call
-    pattern prevents you from blindly writing 'update' as the message: you have
-    to actually inspect the diff first.
+      Call 1: git_commit_and_push()                    ← no message, no diff_hash
+              → tool stages everything and returns:
+                  { needs_inspection: true, diff_hash: '<16-char hex>',
+                    staged_summary: '...', staged_diff: '...' }
 
-    Good commit messages (5-10 words, what+why):
+      Call 2: git_commit_and_push(message='<descriptive 3+ word message>',
+                                  diff_hash='<exact 16-char hex from call 1>')
+              → tool verifies the diff is unchanged, then commits + pushes.
+
+    Why the diff_hash dance: it's the ONLY way to enforce that you actually
+    inspected the staged content before writing a commit message. Without it,
+    you tend to paraphrase the user prompt ('Update: my latest changes') which
+    is useless. With it, you have to read the diff to get the hash, which
+    means you can write a message about what actually changed.
+
+    REJECTED messages (force you to retry):
+      • Empty                              → needs_inspection
+      • Single generic word: 'update', 'fix', 'wip', 'stuff', 'changes'…
+      • Less than 3 words: 'add stuff'
+      • Vague paraphrases of the user prompt: 'my changes', 'latest updates',
+        'check and push' — name the actual feature/fix instead.
+      • diff_hash missing or doesn't match the current staged diff
+
+    Good messages name what changed:
       • 'fix: off-by-one in factorial loop'
-      • 'add /perf command + RAM monitoring'
+      • 'add /perf command + ollama RAM monitoring'
+      • 'bump num_ctx to 32k to stop prompt truncation'
       • 'refactor: split classify() into early returns'
-      • 'bump num_ctx to 32k to fix prompt truncation'
-
-    REJECTED (too generic — the tool will refuse and ask you to look at the diff):
-      'update', 'changes', 'wip', 'fix', 'edits', 'commit', 'stuff'
 
     Args:
-        message: Commit message. Pass "" or omit on first call to see the diff.
-                 On second call, pass a descriptive message (5+ words).
-        add_all: If True (default), runs `git add -A` before committing.
+        message: Commit message (3+ words, describes actual changes).
+        add_all: If True (default), runs `git add -A` before reading the diff.
+        diff_hash: Must match the hash returned by the previous (no-message) call.
     """
     import subprocess as _sp
     cwd = str(_working_dir)
 
-    # First call (or generic message) — stage and return the diff for inspection.
+    # Stage first so the diff reflects what would actually be committed.
+    if add_all:
+        _sp.run(["git", "add", "-A"], cwd=cwd, capture_output=True, timeout=10)
+
+    try:
+        current_hash, stat, diff = _hash_staged_diff(cwd)
+    except Exception as e:
+        return {"error": f"could not read staged diff: {e}"}
+
+    if not stat and not diff:
+        return {"error": "nothing staged — no changes to commit"}
+
+    # Validate the message
     msg_clean = (message or "").strip()
-    is_generic = msg_clean.lower().rstrip(".:!") in _GENERIC_COMMIT_MESSAGES
-    is_too_short = bool(msg_clean) and len(msg_clean.split()) < 3
-    if not msg_clean or is_generic or is_too_short:
-        # Stage everything (if requested) so the diff reflects what would be committed.
-        if add_all:
-            _sp.run(["git", "add", "-A"], cwd=cwd, capture_output=True, timeout=10)
-        # Capture both --stat (file-level summary) and the actual --staged diff.
-        try:
-            stat = _sp.run(["git", "diff", "--staged", "--stat"],
-                           cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
-            diff = _sp.run(["git", "diff", "--staged"],
-                           cwd=cwd, capture_output=True, text=True, timeout=10).stdout
-        except Exception as e:
-            return {"error": f"could not read staged diff: {e}"}
-        if not stat and not diff:
-            return {"error": "nothing staged — no changes to commit"}
-        # Truncate the raw diff so we don't blow the context window.
-        if len(diff) > 3500:
-            diff = diff[:3500] + "\n…(diff truncated)"
-        reason = (
-            "message was empty" if not msg_clean
-            else f"message '{msg_clean}' is too generic"  if is_generic
-            else f"message '{msg_clean}' is too short (need 3+ words)"
-        )
+    msg_lower = msg_clean.lower()
+    is_generic    = msg_lower.rstrip(".:!") in _GENERIC_COMMIT_MESSAGES
+    is_too_short  = bool(msg_clean) and len(msg_clean.split()) < 3
+    is_vague      = any(p in msg_lower for p in _VAGUE_COMMIT_PHRASES)
+    hash_mismatch = diff_hash != current_hash
+
+    needs_inspection = (
+        not msg_clean or is_generic or is_too_short or is_vague or hash_mismatch
+    )
+
+    if needs_inspection:
+        # Truncate raw diff so we don't blow context.
+        diff_for_model = diff if len(diff) <= 3500 else diff[:3500] + "\n…(diff truncated — use git_diff for the full content)"
+        if not msg_clean:
+            reason = "no message provided yet"
+        elif is_generic:
+            reason = f"message '{msg_clean}' is a generic single word — describe what actually changed"
+        elif is_too_short:
+            reason = f"message '{msg_clean}' is too short — need at least 3 words"
+        elif is_vague:
+            reason = (
+                f"message '{msg_clean}' uses vague phrasing (e.g. 'my changes', "
+                "'latest updates') — name the actual feature/fix instead"
+            )
+        elif hash_mismatch and not diff_hash:
+            reason = "diff_hash missing — you must inspect the diff and return its hash"
+        else:
+            reason = (
+                f"diff_hash mismatch (got {diff_hash!r}, expected {current_hash!r}) — "
+                "either you didn't actually inspect, or the staged content changed; re-inspect"
+            )
         return {
-            "needs_message": True,
+            "needs_inspection": True,
             "reason": reason,
+            "diff_hash": current_hash,
             "staged_summary": stat,
-            "staged_diff": diff,
+            "staged_diff": diff_for_model,
             "hint": (
-                "Read the diff above. Then call git_commit_and_push AGAIN with "
-                "a descriptive message that summarises WHAT changed and WHY "
-                "(5-10 words). The diff has been staged for you — don't re-add."
+                f"Read the staged_diff above carefully. Then call this tool AGAIN with:\n"
+                f"  diff_hash='{current_hash}'\n"
+                f"  message='<3+ word description of what the diff actually changes>'"
             ),
         }
 
