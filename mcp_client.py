@@ -599,6 +599,7 @@ TOOL_MAP: dict[str, callable] = {
     "run_shell":              fs.run_shell,
     "git_status":             fs.git_status,
     "git_diff":                fs.git_diff,
+    "git_run":                fs.git_run,
     # Web
     "web_fetch":              fs.web_fetch,
     # Planning
@@ -882,8 +883,35 @@ async def run_turn(user_msg: str, tools: list, history: list, enable_thinking: b
 
     call_signature_counts: dict[str, int] = {}
     consecutive_errors: int = 0   # resets on a successful tool call
+    plan_reminded_at: int = -1    # last round where the plan reminder was injected
 
     for round_num in range(MAX_TOOL_ROUNDS):
+        # ── Plan-anchor (B from the planner-executor recommendation) ─────
+        # Re-inject the declared plan into history as a system reminder.
+        # Fires at round 1 (right after propose_plan likely ran in round 0)
+        # AND whenever the model has had 2+ consecutive errors (drift signal).
+        # Throttled so we don't spam: at most one reminder every 2 rounds.
+        active_plan = fs.get_current_plan()
+        should_remind = (
+            active_plan
+            and round_num >= 1
+            and (round_num - plan_reminded_at) >= 2
+            and (round_num == 1 or consecutive_errors >= 2)
+        )
+        if should_remind:
+            plan_lines = "\n".join(f"   {i+1}. {step}" for i, step in enumerate(active_plan))
+            history.append({
+                "role": "system",
+                "content": (
+                    f"[PLAN REMINDER — anchor against drift]\n"
+                    f"You declared this plan at the start of the turn:\n{plan_lines}\n"
+                    f"Each tool call from now on should advance ONE of these steps. "
+                    f"If you've finished the plan, give the final summary. "
+                    f"If the plan was wrong, call propose_plan again to revise it."
+                ),
+            })
+            plan_reminded_at = round_num
+            print(f"{INDENT}{c('↺', GOLD)}  {c(f'plan reminder injected (round {round_num+1})', GOLD)}")
         # No label = pick a random creative verb (Pondering, Bloviating, ...).
         # We pass label=None deliberately on round 0; subsequent rounds reuse
         # the same verb via the saved `label` variable so the user sees
@@ -1559,9 +1587,11 @@ async def main():
         "   • grep_directory to search content across files\n"
         "   • str_replace_in_file for surgical edits; multi_edit for atomic batches on one file\n"
         "   • run_shell to run tests, linters, scripts, package installs (timeout 30s)\n"
-        "   • git_status, git_diff for code state; diff_file to inspect your own edits\n"
+        "   • git_status, git_diff (READ-ONLY) — to inspect repo state\n"
+        "   • git_run (WRITE) — for add, commit, push, pull, branch, remote, etc.\n"
+        "       Examples: git_run(args='add -A'), git_run(args='push -u origin main')\n"
         "   • web_fetch for online docs/specs\n"
-        "   • propose_plan BEFORE multi-file or 3+ step changes\n"
+        "   • propose_plan — see PLAN-FIRST PROTOCOL below\n"
         "\n"
         "4. CODE WRITING (write, refactor, fix, optimize): MUST call `generate_code` "
         "with a clear prompt and the language. DO NOT write code yourself. After "
@@ -1575,6 +1605,21 @@ async def main():
         "- Prefer surgical edits (str_replace_in_file, multi_edit) over full rewrites.\n"
         "- After non-trivial edits, call diff_file or git_diff to confirm.\n"
         "- Keep responses concise. Cite files/lines (path:N) when explaining code.\n"
+        "\n"
+        "PLAN-FIRST PROTOCOL (mandatory for any 2+ step task):\n"
+        "For ANY task that needs more than one tool call (multi-step edits, "
+        "debugging, refactors, git workflows, multi-file exploration), your "
+        "FIRST tool call MUST be `propose_plan` with an ordered list of "
+        "concrete actions. The runtime persists this plan and re-injects it "
+        "into the conversation on subsequent rounds — so even after 5+ tool "
+        "calls you can refer back to your original plan.\n"
+        "Skipping propose_plan on multi-step tasks causes drift and dead-end "
+        "exploration loops. Always plan first.\n"
+        "Examples that REQUIRE a plan:\n"
+        "   • 'fix bug in factorial.py' → [read file, identify bug, str_replace, verify]\n"
+        "   • 'push my changes'        → [git status, git remote add, git commit, git push]\n"
+        "   • 'explain the auth flow'  → [glob auth*, read entry, read handlers, summarize]\n"
+        "If the plan turns out wrong mid-execution, call propose_plan AGAIN to revise it.\n"
         "\n"
         "TOOL ERROR PROTOCOL (mandatory — do not skip):\n"
         "When a tool returns {\"error\": ...} or a string starting with 'Error:' / "
@@ -1617,6 +1662,10 @@ async def main():
     turn = 0
     while True:
         turn += 1
+        # Each new user turn starts with a fresh plan. propose_plan within
+        # the turn persists across tool rounds (so the reminder logic in
+        # run_turn can re-inject it), but never leaks into the next user turn.
+        fs.clear_current_plan()
         print_session_info(turn)
 
         try:

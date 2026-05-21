@@ -517,7 +517,12 @@ def run_shell(command: str, timeout: int = 30) -> dict:
 
 @mcp.tool()
 def git_status() -> str:
-    """Show `git status --short --branch` for the working directory."""
+    """Show `git status --short --branch` for the working directory.
+
+    READ-ONLY. For staging (add), committing, pushing, or any other git
+    operation, use the `git_run` tool instead — that one accepts arbitrary
+    git args.
+    """
     r = _run_subprocess(["git", "status", "--short", "--branch"])
     if r.get("error"):
         return r["error"]
@@ -530,6 +535,9 @@ def git_status() -> str:
 def git_diff(path: str = "") -> str:
     """Show `git diff` for a path (or the whole working tree if path is empty).
 
+    READ-ONLY. For staging, commit, push, or any other git operation, use the
+    `git_run` tool instead.
+
     Args:
         path: Optional file or directory to diff (default: all changes)
     """
@@ -540,6 +548,28 @@ def git_diff(path: str = "") -> str:
     if r.get("error"):
         return r["error"]
     return r.get("stdout") or "(no diff)"
+
+
+@mcp.tool()
+def git_run(args: str, timeout: int = 30) -> dict:
+    """Run any git command. Use for add, commit, push, pull, branch, log,
+    remote, checkout — anything other than status/diff which have their own
+    tools.
+
+    The 'git' prefix is added automatically: pass everything that comes AFTER
+    `git`. Examples:
+      args='add -A'                       → git add -A
+      args='commit -m "fix: typo"'        → git commit -m "fix: typo"
+      args='push -u origin main'          → git push -u origin main
+      args='remote add origin <url>'      → git remote add origin <url>
+
+    Args:
+        args: Arguments to pass to git (everything after the word `git`)
+        timeout: Max seconds to wait (default 30)
+    """
+    if not args or not args.strip():
+        return {"error": "git_run requires args (e.g. 'add -A', 'commit -m \"msg\"')"}
+    return _run_subprocess(f"git {args}", timeout=timeout, shell=True)
 
 
 # -----------------------
@@ -608,25 +638,52 @@ def web_fetch(url: str) -> str:
 
 # -----------------------
 # Planning
+#
+# `propose_plan` writes the declared steps into _current_plan, a module-level
+# variable that survives across tool calls within a single agent turn. The
+# client's run_turn periodically re-injects this plan into the conversation
+# history as a "[PLAN REMINDER]" system message, so even on long multi-round
+# tasks the model can't lose track of what it set out to do.
 # -----------------------
+
+_current_plan: list[str] = []
+
 
 @mcp.tool()
 def propose_plan(steps: list) -> dict:
     """Declare your plan as a list of steps BEFORE making changes to the filesystem.
 
-    Use this for non-trivial tasks (3+ steps, multiple files, refactors). The
-    plan is echoed back so it appears as a visible artifact to the user.
+    REQUIRED for any task that needs 2+ tool calls (multi-step edits, debugging,
+    refactors, git workflows, anything multi-file). The runtime persists this
+    plan and re-injects it into your conversation context on subsequent rounds,
+    so you can't drift off-task. Skipping it on multi-step work leads to
+    exploratory dead-end loops.
 
     Args:
-        steps: Ordered list of short step descriptions (strings)
+        steps: Ordered list of short step descriptions (strings). Each step
+            should describe ONE concrete action ("read factorial.py", not
+            "fix the bug").
     """
+    global _current_plan
     if not isinstance(steps, list) or not steps:
         return {"error": "steps must be a non-empty list of strings"}
+    _current_plan = [str(s) for s in steps]
     return {
-        "plan": [str(s) for s in steps],
-        "step_count": len(steps),
-        "note": "Plan recorded. Execute step-by-step using the appropriate tools.",
+        "plan": _current_plan,
+        "step_count": len(_current_plan),
+        "note": "Plan recorded. It will be re-injected each round as a reminder.",
     }
+
+
+def get_current_plan() -> list:
+    """Used by the client to read the active plan for re-injection."""
+    return list(_current_plan)
+
+
+def clear_current_plan() -> None:
+    """Called by the client at the END of each agent turn."""
+    global _current_plan
+    _current_plan = []
 
 
 # -----------------------
