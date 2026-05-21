@@ -64,6 +64,15 @@ CHAT_MODEL = "qwen3.5:2b"
 # Must be small enough that the routing decision adds <1s of latency.
 ROUTER_MODEL = "qwen3:0.6b"
 
+# Context window sizes (num_ctx). Ollama's default is 4096, which silently
+# TRUNCATES our prompt (system + IVY.md + 27 tool schemas + history ≈ 4700+
+# tokens at round 0). Setting these explicitly avoids the truncation that
+# was making the model ignore the last sections of the system prompt
+# (TOOL ERROR PROTOCOL, PLAN-FIRST PROTOCOL, GIT WORKFLOW VERIFICATION).
+PRINCIPAL_CTX = 32768   # qwen3:8b native max — fits prompt + long histories
+CHAT_CTX      = 8192    # qwen3.5:2b — light chat, no tools
+ROUTER_CTX    = 2048    # qwen3:0.6b — only needs CHAT/AGENT as output
+
 MODELS_NO_TOOLS: set[str] = set()
 
 # Session telemetry — drives /cost (quick) and /stats (detailed analytics).
@@ -270,6 +279,7 @@ def print_command_list():
             ("/history",        "show conversation history"),
             ("/cost",           "quick token/time summary"),
             ("/stats",          "detailed session analytics + tool breakdown"),
+            ("/perf",           "RAM + system resources snapshot"),
             ("/save <file>",    "export conversation to markdown"),
             ("/yank",           "copy last reply to clipboard"),
             ("/edit",           "open last reply in $EDITOR"),
@@ -415,6 +425,7 @@ SLASH_COMMANDS = [
     ("/no-tools",       "force fast chat-only mode (one msg)"),
     ("/mcp",            "manage external MCP servers"),
     ("/rag",            "manage RAG knowledge sources"),
+    ("/perf",           "RAM + resources snapshot"),
     ("/platform",       "launch the IVY web platform"),
     ("/commands",       "show full command help"),
     ("/exit",           "quit"),
@@ -784,7 +795,7 @@ async def classify_route(user_input: str) -> str:
             ],
             stream=False,
             think=False,
-            options={"num_predict": 6, "temperature": 0.0},
+            options={"num_predict": 6, "temperature": 0.0, "num_ctx": ROUTER_CTX},
         )
         msg = r.get("message") if isinstance(r, dict) else getattr(r, "message", None)
         content = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
@@ -965,7 +976,13 @@ async def run_turn(user_msg: str, tools: list, history: list, enable_thinking: b
                         streaming_text = False
                         spinner.set_tokens(in_tokens=0, out_tokens=0)
 
-                        kwargs = {"model": current_model, "messages": history, "stream": True, "think": enable_thinking}
+                        kwargs = {
+                            "model": current_model,
+                            "messages": history,
+                            "stream": True,
+                            "think": enable_thinking,
+                            "options": {"num_ctx": PRINCIPAL_CTX},
+                        }
                         if supports_tools:
                             kwargs["tools"] = tools
 
@@ -1176,6 +1193,7 @@ async def run_casual_chat(user_msg: str, history: list) -> list:
             messages=history,
             stream=True,
             think=False,   # casual chat is always fast-path; no thinking tokens
+            options={"num_ctx": CHAT_CTX},
         ):
             msg = chunk.get("message") if isinstance(chunk, dict) else getattr(chunk, "message", None)
             msg_d = msg if isinstance(msg, dict) else (msg.model_dump() if msg and hasattr(msg, "model_dump") else (vars(msg) if msg else {}))
@@ -1476,6 +1494,138 @@ def _ivy_platform_pids_windows() -> list[tuple[int, str]]:
         if any(n in cmd for n in _IVY_PLATFORM_NEEDLES):
             found.append((pid, cmd))
     return found
+
+
+# ─────────────────────────────────────────────
+# Resource snapshot (for /perf)
+# ─────────────────────────────────────────────
+
+def _human_bytes(n: int | float) -> str:
+    """Format a byte count as a readable MB/GB string."""
+    if n is None:
+        return "?"
+    n = float(n)
+    if n < 1024 * 1024:
+        return f"{n/1024:.0f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n/1024/1024:.0f} MB"
+    return f"{n/1024/1024/1024:.2f} GB"
+
+
+def _process_rss(pid: int) -> int | None:
+    """Return RSS in bytes for a pid, via `ps -o rss=`. Cross-platform-ish.
+    On macOS/Linux rss is in KB; we convert."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["ps", "-o", "rss=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=2)
+        kb = int(r.stdout.strip() or 0)
+        return kb * 1024
+    except Exception:
+        return None
+
+
+def _ollama_daemon_pid() -> int | None:
+    """Find the ollama serve PID, if running."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["pgrep", "-f", "ollama"], capture_output=True, text=True, timeout=2)
+        pids = [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+        # Filter to the main daemon (usually the parent — smallest pid that owns "ollama serve")
+        for pid in pids:
+            args = _sp.run(["ps", "-p", str(pid), "-o", "args="],
+                           capture_output=True, text=True, timeout=2).stdout
+            if "serve" in args or args.strip().endswith("ollama"):
+                return pid
+        return pids[0] if pids else None
+    except Exception:
+        return None
+
+
+def _ollama_loaded_models() -> list[dict]:
+    """Parse `ollama ps` for currently-loaded models + their memory footprint."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["ollama", "ps"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    lines = (r.stdout or "").splitlines()
+    if len(lines) < 2:
+        return []
+    # Skip header. Parse loosely — column widths vary.
+    out = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        # Format: NAME  ID  SIZE  PROCESSOR  CONTEXT  UNTIL
+        out.append({
+            "name":      parts[0],
+            "size":      " ".join(parts[2:4]) if parts[3].upper() in ("GB", "MB", "KB") else parts[2],
+            "raw_line":  line.strip(),
+        })
+    return out
+
+
+def _system_memory() -> dict:
+    """Return total + available system memory in bytes, cross-platform."""
+    import subprocess as _sp
+    info = {"total": None, "available": None, "platform": sys.platform}
+    if _IS_MAC:
+        try:
+            r = _sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2)
+            info["total"] = int(r.stdout.strip())
+        except Exception:
+            pass
+        try:
+            r = _sp.run(["vm_stat"], capture_output=True, text=True, timeout=2)
+            free_pages = 0
+            page_size = 16384  # Apple Silicon default
+            for line in r.stdout.splitlines():
+                if "page size of" in line:
+                    page_size = int(line.split()[-2])
+                if line.startswith("Pages free:"):
+                    free_pages = int(line.split()[-1].rstrip("."))
+            info["available"] = free_pages * page_size
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            with open("/proc/meminfo") as f:
+                meminfo = {l.split(":")[0]: l.split(":")[1].strip() for l in f if ":" in l}
+            info["total"] = int(meminfo.get("MemTotal", "0 kB").split()[0]) * 1024
+            info["available"] = int(meminfo.get("MemAvailable", "0 kB").split()[0]) * 1024
+        except Exception:
+            pass
+    return info
+
+
+def perf_snapshot() -> dict:
+    """Gather a one-shot performance/resource snapshot for /perf."""
+    own_pid = os.getpid()
+    ollama_pid = _ollama_daemon_pid()
+    return {
+        "ivy": {
+            "pid": own_pid,
+            "rss": _process_rss(own_pid),
+        },
+        "ollama": {
+            "pid": ollama_pid,
+            "rss": _process_rss(ollama_pid) if ollama_pid else None,
+            "loaded_models": _ollama_loaded_models(),
+        },
+        "system": _system_memory(),
+        "config": {
+            "principal_model": OLLAMA_MODEL,
+            "chat_model": CHAT_MODEL,
+            "router_model": ROUTER_MODEL,
+            "principal_ctx": PRINCIPAL_CTX,
+            "chat_ctx": CHAT_CTX,
+            "router_ctx": ROUTER_CTX,
+        },
+    }
 
 
 def _kill_ivy_platform_processes() -> tuple[int, list[str]]:
@@ -1831,6 +1981,51 @@ async def main():
                 print(f"{INDENT}{c('├─ files modified', GRAY)}")
                 for f in sorted(TOUCHED_FILES):
                     _box_row(c(f, WHITE))
+            _box_bot()
+            turn -= 1
+            continue
+
+        if user_input.lower() == "/perf":
+            snap = perf_snapshot()
+            _box_top("performance · resources")
+            # IVY's own process
+            ivy_rss   = _human_bytes(snap["ivy"]["rss"]) if snap["ivy"]["rss"] else "?"
+            ivy_pid_s = f"(pid {snap['ivy']['pid']})"
+            _box_row(f"{c('ivy process    ', GRAY)}  {c(ivy_rss, WHITE, BOLD)}  {c(ivy_pid_s, GRAY)}")
+            # Ollama daemon
+            ollama_rss   = _human_bytes(snap["ollama"]["rss"]) if snap["ollama"]["rss"] else "?"
+            ollama_pid   = snap["ollama"]["pid"]
+            ollama_label = f"(pid {ollama_pid})" if ollama_pid else "(not running)"
+            _box_row(f"{c('ollama daemon  ', GRAY)}  {c(ollama_rss, WHITE, BOLD)}  {c(ollama_label, GRAY)}")
+            # Loaded models
+            print(f"{INDENT}{c('├─ ollama models loaded', GRAY)}")
+            if not snap["ollama"]["loaded_models"]:
+                _box_row(c("(none — first inference will load on demand)", GRAY))
+            else:
+                for m in snap["ollama"]["loaded_models"]:
+                    _box_row(f"{c(m['name'].ljust(28), GOLD, BOLD)}  {c(m['size'], WHITE)}")
+            # System memory
+            print(f"{INDENT}{c('├─ system memory', GRAY)}")
+            tot   = snap["system"]["total"]
+            avail = snap["system"]["available"]
+            if tot:
+                _box_row(f"{c('total       ', GRAY)}  {c(_human_bytes(tot), WHITE, BOLD)}")
+            if avail and tot:
+                pct_used = (1 - avail / tot) * 100
+                pct_str  = f"({pct_used:.0f}%)"
+                used_str = _human_bytes(tot - avail)
+                bar      = "▇" * int(pct_used / 5)
+                _box_row(f"{c('used        ', GRAY)}  {c(used_str, WHITE, BOLD)}  {c(pct_str, GRAY)}  {c(bar, GOLD)}")
+                _box_row(f"{c('available   ', GRAY)}  {c(_human_bytes(avail), WHITE, BOLD)}")
+            # Active config (num_ctx)
+            print(f"{INDENT}{c('├─ active config (num_ctx)', GRAY)}")
+            cfg = snap["config"]
+            p_ctx = f"ctx={cfg['principal_ctx']:,}"
+            c_ctx = f"ctx={cfg['chat_ctx']:,}"
+            r_ctx = f"ctx={cfg['router_ctx']:,}"
+            _box_row(f"{c('principal   ', GRAY)}  {c(cfg['principal_model'], GOLD)}  {c(p_ctx, WHITE)}")
+            _box_row(f"{c('chat        ', GRAY)}  {c(cfg['chat_model'], GOLD)}  {c(c_ctx, WHITE)}")
+            _box_row(f"{c('router      ', GRAY)}  {c(cfg['router_model'], GOLD)}  {c(r_ctx, WHITE)}")
             _box_bot()
             turn -= 1
             continue
