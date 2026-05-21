@@ -569,7 +569,81 @@ def git_run(args: str, timeout: int = 30) -> dict:
     """
     if not args or not args.strip():
         return {"error": "git_run requires args (e.g. 'add -A', 'commit -m \"msg\"')"}
-    return _run_subprocess(f"git {args}", timeout=timeout, shell=True)
+    r = _run_subprocess(f"git {args}", timeout=timeout, shell=True)
+    # Append actionable hints to common confusing outputs.
+    err = (r.get("stderr") or "") + (r.get("stdout") or "")
+    if "Everything up-to-date" in err:
+        r["note"] = (
+            "NOTE: no commits were pushed because nothing is ahead of origin. "
+            "Did you forget to `commit` first?"
+        )
+    return r
+
+
+@mcp.tool()
+def git_commit_and_push(message: str, add_all: bool = True) -> dict:
+    """ATOMIC end-to-end: stage all changes, commit with `message`, and push.
+
+    USE THIS for any 'push my changes' / 'send to github' request — it's a
+    single tool call so you cannot accidentally skip the commit step. Returns
+    a per-step status dict.
+
+    If `add_all=False`, only ALREADY staged changes are committed (useful when
+    you've staged specific files manually beforehand).
+
+    The function returns early at the first failing step with `done_steps`
+    listing which steps actually completed — so callers can see exactly what
+    happened.
+
+    Args:
+        message: Commit message. REQUIRED.
+        add_all: If True (default), runs `git add -A` before committing.
+    """
+    import subprocess as _sp
+    if not message or not message.strip():
+        return {"error": "commit message is required"}
+    steps_done: list = []
+    cwd = str(_working_dir)
+
+    def _run(label: str, cmd: list, allow_empty_commit_skip: bool = False) -> dict | None:
+        try:
+            r = _sp.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+        except _sp.TimeoutExpired:
+            return {"error": f"{label} timed out"}
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        # Tolerate "nothing to commit" if asked (idempotent re-runs).
+        if allow_empty_commit_skip and r.returncode != 0 and "nothing to commit" in (out + err):
+            steps_done.append({"step": label, "exit_code": 0, "note": "nothing to commit — skipped"})
+            return None
+        steps_done.append({"step": label, "exit_code": r.returncode, "stdout": out[:600], "stderr": err[:600]})
+        if r.returncode != 0:
+            return {"error": f"{label} failed with exit {r.returncode}", "done_steps": steps_done}
+        return None
+
+    if add_all:
+        e = _run("add", ["git", "add", "-A"])
+        if e: return e
+
+    # The commit step is the one that's been hallucinated — call it explicitly.
+    e = _run("commit", ["git", "commit", "-m", message], allow_empty_commit_skip=True)
+    if e: return e
+
+    e = _run("push", ["git", "push"])
+    if e: return e
+
+    # Final verification — what git itself thinks of the state.
+    try:
+        status = _sp.run(["git", "status", "--short", "--branch"],
+                         cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        status = "(could not read status)"
+    return {
+        "ok": True,
+        "done_steps": steps_done,
+        "post_status": status,
+        "note": "If post_status doesn't say 'up to date with origin' and is clean, run me again.",
+    }
 
 
 # -----------------------

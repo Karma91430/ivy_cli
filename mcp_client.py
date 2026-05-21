@@ -600,6 +600,7 @@ TOOL_MAP: dict[str, callable] = {
     "git_status":             fs.git_status,
     "git_diff":                fs.git_diff,
     "git_run":                fs.git_run,
+    "git_commit_and_push":    fs.git_commit_and_push,
     # Web
     "web_fetch":              fs.web_fetch,
     # Planning
@@ -1588,8 +1589,19 @@ async def main():
         "   • str_replace_in_file for surgical edits; multi_edit for atomic batches on one file\n"
         "   • run_shell to run tests, linters, scripts, package installs (timeout 30s)\n"
         "   • git_status, git_diff (READ-ONLY) — to inspect repo state\n"
-        "   • git_run (WRITE) — for add, commit, push, pull, branch, remote, etc.\n"
-        "       Examples: git_run(args='add -A'), git_run(args='push -u origin main')\n"
+        "   • git_commit_and_push(message) — ATOMIC: stages + commits + pushes in ONE\n"
+        "       call. PREFER THIS for any 'push my changes' / 'commit and push' request.\n"
+        "       Using separate add+commit+push calls invites you to skip the commit step.\n"
+        "   • git_run(args) — WRITE primitive for git ops not covered above\n"
+        "       (e.g. branch, checkout, remote add, log)\n"
+        "\n"
+        "GIT WORKFLOW VERIFICATION (mandatory):\n"
+        "After any git workflow that's supposed to push commits, your LAST tool\n"
+        "call MUST be `git_status`. The output must contain BOTH 'up to date with\n"
+        "origin' AND show a clean tree (no `M`/`??` lines). If it doesn't, the\n"
+        "push did NOT succeed — continue the workflow. NEVER claim success based\n"
+        "on the absence of an error from a push command alone (e.g. 'Everything\n"
+        "up-to-date' means NOTHING was pushed).\n"
         "   • web_fetch for online docs/specs\n"
         "   • propose_plan — see PLAN-FIRST PROTOCOL below\n"
         "\n"
