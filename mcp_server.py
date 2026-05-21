@@ -580,30 +580,87 @@ def git_run(args: str, timeout: int = 30) -> dict:
     return r
 
 
+# Generic / low-quality commit messages that the diff-aware path rejects.
+# The model has to look at the actual changes and write something specific.
+_GENERIC_COMMIT_MESSAGES = {
+    "update", "updates", "updated", "changes", "change", "edits", "edit",
+    "fix", "fixes", "fixed", "wip", "stuff", "commit", "misc", "tweaks",
+    "ok", "done", "save", "various", "improvements",
+}
+
+
 @mcp.tool()
-def git_commit_and_push(message: str, add_all: bool = True) -> dict:
+def git_commit_and_push(message: str = "", add_all: bool = True) -> dict:
     """ATOMIC end-to-end: stage all changes, commit with `message`, and push.
 
-    USE THIS for any 'push my changes' / 'send to github' request — it's a
-    single tool call so you cannot accidentally skip the commit step. Returns
-    a per-step status dict.
+    DIFF-AWARE WORKFLOW (two-call pattern):
+      1. FIRST call with no message (or `message=""`) — the tool stages changes
+         and returns the STAGED DIFF + a per-file summary. You then read that
+         and write a descriptive commit message based on the actual changes.
+      2. SECOND call with `message=<your descriptive message>` — the tool
+         commits + pushes for real.
 
-    If `add_all=False`, only ALREADY staged changes are committed (useful when
-    you've staged specific files manually beforehand).
+    USE THIS for any 'push my changes' / 'send to github' request. The two-call
+    pattern prevents you from blindly writing 'update' as the message: you have
+    to actually inspect the diff first.
 
-    The function returns early at the first failing step with `done_steps`
-    listing which steps actually completed — so callers can see exactly what
-    happened.
+    Good commit messages (5-10 words, what+why):
+      • 'fix: off-by-one in factorial loop'
+      • 'add /perf command + RAM monitoring'
+      • 'refactor: split classify() into early returns'
+      • 'bump num_ctx to 32k to fix prompt truncation'
+
+    REJECTED (too generic — the tool will refuse and ask you to look at the diff):
+      'update', 'changes', 'wip', 'fix', 'edits', 'commit', 'stuff'
 
     Args:
-        message: Commit message. REQUIRED.
+        message: Commit message. Pass "" or omit on first call to see the diff.
+                 On second call, pass a descriptive message (5+ words).
         add_all: If True (default), runs `git add -A` before committing.
     """
     import subprocess as _sp
-    if not message or not message.strip():
-        return {"error": "commit message is required"}
-    steps_done: list = []
     cwd = str(_working_dir)
+
+    # First call (or generic message) — stage and return the diff for inspection.
+    msg_clean = (message or "").strip()
+    is_generic = msg_clean.lower().rstrip(".:!") in _GENERIC_COMMIT_MESSAGES
+    is_too_short = bool(msg_clean) and len(msg_clean.split()) < 3
+    if not msg_clean or is_generic or is_too_short:
+        # Stage everything (if requested) so the diff reflects what would be committed.
+        if add_all:
+            _sp.run(["git", "add", "-A"], cwd=cwd, capture_output=True, timeout=10)
+        # Capture both --stat (file-level summary) and the actual --staged diff.
+        try:
+            stat = _sp.run(["git", "diff", "--staged", "--stat"],
+                           cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
+            diff = _sp.run(["git", "diff", "--staged"],
+                           cwd=cwd, capture_output=True, text=True, timeout=10).stdout
+        except Exception as e:
+            return {"error": f"could not read staged diff: {e}"}
+        if not stat and not diff:
+            return {"error": "nothing staged — no changes to commit"}
+        # Truncate the raw diff so we don't blow the context window.
+        if len(diff) > 3500:
+            diff = diff[:3500] + "\n…(diff truncated)"
+        reason = (
+            "message was empty" if not msg_clean
+            else f"message '{msg_clean}' is too generic"  if is_generic
+            else f"message '{msg_clean}' is too short (need 3+ words)"
+        )
+        return {
+            "needs_message": True,
+            "reason": reason,
+            "staged_summary": stat,
+            "staged_diff": diff,
+            "hint": (
+                "Read the diff above. Then call git_commit_and_push AGAIN with "
+                "a descriptive message that summarises WHAT changed and WHY "
+                "(5-10 words). The diff has been staged for you — don't re-add."
+            ),
+        }
+
+    # Real commit + push path
+    steps_done: list = []
 
     def _run(label: str, cmd: list, allow_empty_commit_skip: bool = False) -> dict | None:
         try:
